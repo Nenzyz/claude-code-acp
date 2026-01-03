@@ -9,6 +9,10 @@ import {
   ForkSessionResponse,
   InitializeRequest,
   InitializeResponse,
+  ListSessionsRequest,
+  ListSessionsResponse,
+  LoadSessionRequest,
+  LoadSessionResponse,
   ndJsonStream,
   NewSessionRequest,
   NewSessionResponse,
@@ -60,6 +64,7 @@ import { ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { BetaContentBlock, BetaRawContentBlockDelta } from "@anthropic-ai/sdk/resources/beta.mjs";
 import packageJson from "../package.json" with { type: "json" };
 import { randomUUID } from "node:crypto";
+import * as sessionStorage from "./session-storage.js";
 
 export const CLAUDE_CONFIG_DIR = process.env.CLAUDE ?? path.join(os.homedir(), ".claude");
 
@@ -192,6 +197,8 @@ export class ClaudeAcpAgent implements Agent {
           fork: {},
           resume: {},
         },
+        // Advertise session management capability
+        loadSession: true,
       },
       agentInfo: {
         name: packageJson.name,
@@ -249,6 +256,169 @@ export class ClaudeAcpAgent implements Agent {
     throw new Error("Method not implemented.");
   }
 
+  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+    const { sessions, nextCursor } = sessionStorage.listSessions({
+      cwd: params.cwd ?? undefined,
+      cursor: params.cursor ?? undefined,
+      limit: 20,
+    });
+
+    return {
+      sessions: sessions.map((s) => ({
+        sessionId: s.sessionId,
+        title: s.title,
+        cwd: s.cwd,
+        updatedAt: new Date(s.updatedAt).toISOString(),
+      })),
+      nextCursor: nextCursor ?? null,
+    };
+  }
+
+  async loadSession(params: LoadSessionRequest): Promise<LoadSessionResponse> {
+    // Verify the session exists in our storage
+    const sessionMeta = sessionStorage.getSession(params.sessionId);
+    if (!sessionMeta) {
+      throw new Error(`Session not found: ${params.sessionId}`);
+    }
+
+    // Read conversation history from SDK's .jsonl file for UI display
+    const sessionFilePath = this.getSessionFilePath(params.cwd, params.sessionId);
+    const conversationHistory = this.readSessionHistory(sessionFilePath);
+
+    // Determine fork mode from params (default to fork for safety)
+    const shouldFork = params._meta?.fork !== false;
+
+    // Resume the session using SDK's built-in resume feature
+    // This automatically loads the conversation context into Claude's memory
+    const response = await this.createSession(
+      {
+        cwd: params.cwd,
+        mcpServers: params.mcpServers,
+      },
+      {
+        resume: params.sessionId,
+        forkSession: shouldFork,
+      },
+    );
+
+    // Return modes, models, AND conversation history via _meta
+    return {
+      modes: response.modes ?? null,
+      models: response.models ?? null,
+      _meta: {
+        // Pass the OLD session ID so client knows which history to display
+        originalSessionId: params.sessionId,
+        // Pass the NEW session ID (will be same as original if not forking)
+        newSessionId: response.sessionId,
+        // Pass the full conversation history for UI display
+        conversationHistory,
+        // Indicate whether this was a fork
+        forked: shouldFork,
+      },
+    };
+  }
+
+  /**
+   * Get the file path for a session's .jsonl file
+   */
+  private getSessionFilePath(cwd: string, sessionId: string): string {
+    const projectName = cwd.replace(/\//g, "-");
+    return path.join(
+      CLAUDE_CONFIG_DIR,
+      "projects",
+      projectName,
+      `${sessionId}.jsonl`,
+    );
+  }
+
+  /**
+   * Read conversation history from a session .jsonl file
+   */
+  private readSessionHistory(sessionFilePath: string): Array<{
+    role: string;
+    content: Array<{ type: string; text: string }>;
+    timestamp: string;
+  }> {
+    if (!fs.existsSync(sessionFilePath)) {
+      this.logger.log(`[AcpAgent] Session file not found: ${sessionFilePath}`);
+      return [];
+    }
+
+    const content = fs.readFileSync(sessionFilePath, "utf-8");
+    const lines = content
+      .trim()
+      .split("\n")
+      .filter((line) => line.length > 0);
+
+    this.logger.log(`[AcpAgent] Reading ${lines.length} lines from session file`);
+
+    const messages: Array<{
+      role: string;
+      content: Array<{ type: string; text: string }>;
+      timestamp: string;
+    }> = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+
+        // Only keep user and assistant messages
+        if (entry.type === "user" || entry.type === "assistant") {
+          messages.push({
+            role: entry.message?.role || entry.type,
+            content: entry.message?.content || [],
+            timestamp: entry.timestamp,
+          });
+        }
+      } catch (error) {
+        this.logger.error(`[AcpAgent] Failed to parse session line: ${line}`);
+      }
+    }
+
+    this.logger.log(`[AcpAgent] Found ${messages.length} conversation messages`);
+    return messages;
+  }
+
+  /**
+   * Delete a session.
+   * Removes the session from metadata storage and deletes the .jsonl file.
+   */
+  async deleteSession(params: { sessionId: string; cwd: string }): Promise<void> {
+    this.logger.log(`[AcpAgent] Deleting session: ${params.sessionId}`);
+
+    // Remove from session storage metadata
+    sessionStorage.deleteSession(params.sessionId);
+
+    // Delete the .jsonl file
+    const sessionFilePath = this.getSessionFilePath(params.cwd, params.sessionId);
+    if (fs.existsSync(sessionFilePath)) {
+      fs.unlinkSync(sessionFilePath);
+      this.logger.log(`[AcpAgent] Deleted session file: ${sessionFilePath}`);
+    }
+  }
+
+  /**
+   * Rename a session.
+   * Updates the session title in metadata storage.
+   */
+  async renameSession(params: { sessionId: string; newTitle: string }): Promise<void> {
+    this.logger.log(`[AcpAgent] Renaming session: ${params.sessionId} to "${params.newTitle}"`);
+
+    const sessionMeta = sessionStorage.getSession(params.sessionId);
+    if (!sessionMeta) {
+      throw new Error(`Session not found: ${params.sessionId}`);
+    }
+
+    // Update session with new title
+    sessionStorage.upsertSession({
+      sessionId: params.sessionId,
+      title: params.newTitle,
+      cwd: sessionMeta.cwd,
+    });
+
+    this.logger.log(`[AcpAgent] Session renamed successfully`);
+  }
+
   async prompt(params: PromptRequest): Promise<PromptResponse> {
     if (!this.sessions[params.sessionId]) {
       throw new Error("Session not found");
@@ -257,6 +427,34 @@ export class ClaudeAcpAgent implements Agent {
     this.sessions[params.sessionId].cancelled = false;
 
     const { query, input } = this.sessions[params.sessionId];
+
+    // Update session title from first user message (if still "Untitled Session")
+    const sessionMeta = sessionStorage.getSession(params.sessionId);
+    if (sessionMeta && sessionMeta.title === "Untitled Session") {
+      const textContent = params.prompt?.find((c: any) => c.type === "text");
+      if (textContent && "text" in textContent) {
+        const fullText = textContent.text;
+        // Skip if it's a system event (starts with <tag>)
+        if (!fullText.startsWith("<")) {
+          // Take first 60 chars, truncate at word boundary for cleaner titles
+          let title = fullText.slice(0, 60);
+          if (fullText.length > 60) {
+            const lastSpace = title.lastIndexOf(" ");
+            if (lastSpace > 30) {
+              // Only truncate at word if we keep at least 30 chars
+              title = title.slice(0, lastSpace) + "...";
+            } else {
+              title = title + "...";
+            }
+          }
+          sessionStorage.upsertSession({
+            sessionId: params.sessionId,
+            title,
+            cwd: sessionMeta.cwd,
+          });
+        }
+      }
+    }
 
     input.push(promptToClaude(params));
     while (true) {
@@ -782,6 +980,15 @@ export class ClaudeAcpAgent implements Agent {
       settingsManager,
     };
 
+    // Track session for history/rewind
+    if (!creationOpts.resume || creationOpts.forkSession) {
+      sessionStorage.upsertSession({
+        sessionId,
+        title: "Untitled Session", // Will be updated on first prompt
+        cwd: params.cwd,
+      });
+    }
+
     const availableCommands = await getAvailableSlashCommands(q);
     const models = await getAvailableModels(q);
 
@@ -835,6 +1042,23 @@ export class ClaudeAcpAgent implements Agent {
         availableModes,
       },
     };
+  }
+
+  /**
+   * Handle extension methods (custom methods not in ACP spec).
+   * Allows clients to call custom methods like deleteSession.
+   */
+  async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    switch (method) {
+      case "deleteSession":
+        await this.deleteSession(params as { sessionId: string; cwd: string });
+        return {};
+      case "renameSession":
+        await this.renameSession(params as { sessionId: string; newTitle: string });
+        return {};
+      default:
+        throw new Error(`Unknown extension method: ${method}`);
+    }
   }
 }
 
